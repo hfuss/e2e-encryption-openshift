@@ -1,4 +1,4 @@
-## Easier End-to-End TLS with OpenShift
+## Easier End-to-End TLS for Spring Boot Apps using OpenShift
 **Hayden Fuss**  
 **Rough Draft**
 
@@ -6,64 +6,64 @@
 
 One of the greatest features of OpenShift is its abstractions
 for exposing, securing, and properly load-balancing your web
-services.
+apps or services.
 
-This series is meant for platform engineers and application
-developers who are new to OpenShift or looking to expand their
-knowledge. The goal is to cover some useful features you
-could leverage to implement end-to-end TLS for your web services
-as opposed to the more commonly used edge terminated TLS.
+The goal of this series is to cover some self-service features a developer
+could leverage to automate end-to-end TLS for their web apps, particularly
+Spring Boot, as opposed to the more commonly used edge terminated TLS.
 
-We will then dive a little deeper to discuss some practices you
-could use to automate this setup for your development teams, and
-in particular we will cover what is involved in doing so for
-Spring Boot applications. Lastly, we will go over how to handle
-certificate expiration and the difficulties that arise with
-Java keystores when doing so.
+Service meshes like [Istio](https://istio.io/) are certainly making end-to-end
+TLS (as well as [mTLS]()) even easier; however,
+[OpenShift Service Mesh](https://docs.openshift.com/container-platform/3.11/servicemesh-install/servicemesh-install.html),
+RedHat's enterprise flavor of Istio for OpenShift, will still be in
+[tech preview](https://docs.openshift.com/container-platform/4.1/release_notes/ocp-4-1-release-notes.html#ocp-4-1-technology-preview)
+for [OpenShift 4.1](https://docs.openshift.com/container-platform/4.1/welcome/index.html).
+The approach we will cover is a decent alternative that can be entirely
+automated without (much) help from a cluster administrator.
 
-There will be links and code snippets throughout the articles,
-but if you want something you could get your hands on check out
-the [sample code](https://github.com/hfuss/e2e-encryption-openshift). For
-these examples, we will assume our OpenShift cluster
+For these examples, we will assume our OpenShift cluster
 administrators have taken care of two important details:
 
 1. There is a `*.apps.example.com` DNS record pointed
-to the cluster's load-balancer.
-2. The cluster's load-balancer has a valid TLS certificate for `*.apps.example.com`.
+   to the cluster's load-balancer.
+2. The cluster's load-balancer has a valid TLS certificate for
+   `*.apps.example.com`.
 
-If this is not the case for your cluster, work with your cluster administrators in getting a similar setup made and have them consider setting up tools such as [External DNS]() and [Certificate Manager]().
+If this is not the case for your cluster(s), work with your cluster
+administrators in getting a similar setup made and have them consider installing
+add-ons such as
+[External DNS](https://github.com/kubernetes-incubator/external-dns) and
+[Certificate Manager](https://github.com/jetstack/cert-manager).
+
+The requirements for us are as follows:
+
+* Self-service, automated end-to-end TLS for Spring Boot apps, whether it be
+  external or internal traffic
+* Avoid managing external certificates directly, preserving a separation of
+  duties between developers and cluster administrators
+* Path-based routing for external traffic
 
 ### Part One: Re-encrypt TLS and Automated Internal Certificates with OpenShift
 
 #### Introducing the `Route`
 
-So first things first, what are these great OpenShift
-abstractions for exposing and load-balancing web services and
-how do they differ from what else exists in the Kubernetes
-landscape?
-
-Before there was the `Ingress` in Kubernetes, the OpenShift
-developers had provided `Route`'s. Both make managing external
-access to HTTP/HTTPS `Service`'s running on a cluster
-relatively easy. However, there are some notable differences,
+Before
+[`Ingress`](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+was added in Kubernetes in 1.1, the OpenShift developers had provided
+[`Route`'s](https://docs.openshift.com/container-platform/3.11/architecture/networking/routes.html).
+Both make managing external access to HTTP/HTTPS `Service`'s running on a
+cluster relatively easy. However, there are some notable differences,
 see the [Appendix](#ingress-vs-route) for a more in-depth
 comparison between `Route`'s and `Ingress`'s if you are
 interested.
 
-Overall, a `Route` in some ways is a slightly simpler
-abstraction which provides more robust support for handling
-TLS, and a greater separation of duties between the cluster
-administrators and developers. Additionally, with OpenShift
-3.10 there is now an ingress controller which will
-automatically make a `Route` (or possibly multiple) in the
-background for any `Ingress`'s you define.
+Overall, a `Route` is a slightly simpler abstraction which provides
+more robust support for handling TLS out-of-the-box.
 
 #### HTTPS Made Easy
 
-In pursuit of our goal of end-to-end TLS for our web services,
-we will take advantage of what `Route`'s have to offer.
-Firstly, using a `Route` we can easily expose an HTTP `Service`
-with a hostname under a certain path:
+Using a `Route` we can easily expose an HTTP `Service`
+with a hostname under a particular path:
 
 ```
 ---
@@ -98,6 +98,7 @@ metadata:
     component: my-component
 spec:
   host: my-component.apps.example.com
+  path: /api/v1
   to:
     name: my-component-v1
     kind: Service
@@ -105,9 +106,8 @@ spec:
     targetPort: http
 ```
 
-Even better, we can then secure our web service with edged
-terminated TLS and the ensure our users are always redirected
-to the HTTPS port of the load-balancer:
+We can also externally secure our web service with edged-terminated TLS and
+ensure our users are always redirected to the HTTPS port of the router:
 
 ```
   tls:
@@ -115,7 +115,7 @@ to the HTTPS port of the load-balancer:
     insecureEdgeTerminationPolicy: Redirect
 ```
 
-so now our `Route` as a whole looks like:
+Now our `Route` as a whole looks like:
 
 ```
 ---
@@ -129,6 +129,7 @@ metadata:
     component: my-component
 spec:
   host: my-component.apps.example.com
+  path: /api/v1
   to:
     name: my-component-v1
     kind: Service
@@ -141,39 +142,20 @@ spec:
 
 #### End-to-End TLS Made Easier
 
-Alright so that was pretty easy and we are a few steps closer
-to achieving end-to-end TLS. Moving forward, we first need our
-`Route` to no longer edge terminate TLS, which leaves us with
-two options for the termination policy: `passthrough` and
+We need our `Route` to no longer edge-terminate TLS,
+which leaves us with two options for the termination policy: `passthrough` and
 `reencrypt`.
 
-With `passthrough`, the load-balancer will not participate in
-the TLS handshake and will simply send all traffic straight to
-the `Service` and then your `Pod`'s. That means your `Pod`'s
-would need a valid TLS cert for `my-component.apps.example.com`
-for the sake of the external client.
+In short, `reencrypt` is better for our needs because it still supports
+path-based routing, and does not require us to obtain a certificate issued for
+the external hostname. For a more in-depth overview of `reencrypt` versus
+`passthrough` check out this Red Hat
+[blog post](https://blog.openshift.com/self-serviced-end-to-end-encryption-approaches-for-applications-deployed-in-openshift/).
 
-With `reencrypt`, the load-balancer will handle the TLS
-handshake with the external client. Then it will do its own TLS
-handshake with the `Pod`'s at the end of your `Service`,
-re-encrypting the packets based on the TLS cert your pods are
-serving. Depending on what cert your `Pod`'s serve, you can
-specify a `destinationCACertificate` in the `Route` so that it
-trusts your cert. Run `oc explain route.spec.tls` for more
-details on all three policies and what additional options you
-have.
-
-Aside from needing a valid cert
-`my-component.apps.example.com`, the other drawback to
-`passthrough` is that internal `Service` hostname, i.e.
-`my-component-v1.my-app.svc.cluster.local`, would still be
-considered invalid. With `reencrypt` you could still achieve
-this, but then your `Pod`'s need a valid cert for that internal
-hostname... luckily OpenShift can automatically provide just
-that!
-
-OpenShift has a [special `Service` annotation]() that will tell
-it to automatically create a cert, all you add is the following:
+With `reencrypt` termination, our app will need to serve a certificate that
+our router trusts and ideally is valid for our `Service`'s hostname.
+Luckily, OpenShift has a special `Service` annotation]() that will provide
+the internal certificate we need, all you add is the following:
 
 ```
 annotations:
@@ -183,9 +165,9 @@ annotations:
 OpenShift will then make a [`kubernetes.io/tls`]() type
 `Secret` called `my-component-v1`, and it will contain the key
 and cert in PEM format. We will discuss ways you can have your
-application `Pod`'s consume this `Secret` in the next article.
+Spring Boot application consume this `Secret` in the next article.
 
-But so, putting this altogether our setup now looks like:
+Putting this altogether our setup now looks like:
 
 ```
 ---
@@ -232,26 +214,27 @@ spec:
     insecureEdgeTerminationPolicy: Redirect
 ```
 
-And so at last we have everything in place at the routing level
+At last we have everything in place at the infrastructure level
 for end-to-end TLS!
 
-#### Moving Forward
+#### Next Steps
 
-So that was not terribly hard but again we made some
-assumptions regarding DNS and the cluster load-balancer. If
-your cluster's load-balancer does not have the TLS cert for
-your `Route`'s hostname you can also provide the cert within
-your `Route`'s manifest.
+So far so good, but again we had made some
+assumptions regarding DNS and the cluster router. If
+your cluster's router does not have the TLS certificate for
+your `Route`'s hostname you can also provide the certificate and key within
+your `Route`'s manifest, see the [documentation]() for more details.
 
-In the next article, we are going to automate this setup and
-bootstrapping TLS for Spring Boot apps using a handy Helm chart.
+In the next article, we are going to bootstrap TLS and configure the Java keystore
+for our Spring Boot apps, and then we will begin automating this setup by
+writing a generic Helm chart.
 
 #### Appendix
 
 ##### `Ingress` vs. `Route`
 
 `Ingress`'s have the following features:
-- Configures a proxy or load-balancer, such as NGINX, providing a single, external IP address for you to use. Depending on the underlying cloud platform or infrastructure you are using, your ingress controller will handle this configuration
+- Configures a proxy or load-balancer, such as NGINX, providing a single, external IP address for you to use. Depending on the underlying cloud platform or infrastructure you are using, your ingress controller will handle this configuration.
 - Defines path-based routing to fan out to multiple `Service`'s for mutliple paths whether it be for a certain hostname(s) or any hostname
 - A single `Ingress` can also define routing rules for multiple hostnames using name-based virtual hosting
 - TLS `Secret`'s can be provided to the `Ingress` to configure edge terminated HTTPS
@@ -259,7 +242,7 @@ bootstrapping TLS for Spring Boot apps using a handy Helm chart.
 
 On the other hand, `Route`'s provide the following:
 
-- Leverages the existing HAProxy, F5 Big IP, or NGINX load balancer that has been configured for the OpenShift cluster. As a result, the IP address is often the same for all `Route`'s and name-based virtual hosting is always used.
+- Leverages the existing HAProxy, F5 Big IP, or NGINX router that has been configured for the OpenShift cluster. As a result, the IP address is often the same for all `Route`'s and name-based virtual hosting is always used.
 - A `Route` can only be defined for a single hostname and optional path. Multiple `Route`'s are required to configure different paths under the same hostname.
 - Simple weight-based load-balancing for multiple backend `Service`'s
 - TLS certificates and keys can be provided. However, a `Route` can serve the existing certs and keys that are configured on the cluster's load balancer.
