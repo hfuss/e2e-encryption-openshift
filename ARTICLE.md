@@ -249,6 +249,8 @@ On the other hand, `Route`'s provide the following:
 - TLS can either be edge-terminated, passed through, or re-encrypted. For re-encrypt, a CA certificate can be provided so that the router trusts the destination.
 - Insecure HTTP traffic can be automatically redirected to the load-balancer's HTTPS port
 
+thing
+
 ### Part Two: Bootstrapping End-to-end TLS for Spring Boot Apps on OpenShift
 
 TODO: recap from Part One
